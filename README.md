@@ -42,6 +42,7 @@ cat dsh/bonsai-provider.patch.yml
 | `bonsai logs [n]` / `proxy-logs [n]` | 看后端 / 代理日志 |
 | `bonsai doctor` | 自检：文件、运行时、端口、自启状态 |
 | `bonsai thinking …` | 思考模式：力度 / 预算上限 / 完全关闭 |
+| `bonsai idle [秒\|off]` | 空闲多久自动卸载（电池模式调到 300） |
 | `bonsai autostart on\|off\|status` | 登录自启开关（LaunchAgent，只跑代理） |
 
 `bonsai` 会被装到 `~/.local/bin`，脚本本身按真实路径定位安装目录，仓库放哪都行。
@@ -69,11 +70,16 @@ DSH 每轮都会往 prompt 里塞系统提示、工具清单、工作区说明�
 ```
 
 `33797 + maxTokens 8192 = 41989 < 65536`，现在这种溢出有足够余量。
+实测造了一个 **34,079 token** 的请求（高于旧上限 32768）直接打代理：HTTP 200，正常回「收到」，
+预填充 718s（电池供电 + 温控下只有 ~50 tok/s；插电时约 90 tok/s）。
 如果还想更保守，把 DSH 的 `contextWindow` 降到 24576（改 `cordis.patch.yml` 后重启 DSH），
 代价是更早触发历史压缩。
 
 > 预填充只有 90–130 tok/s，32K 的 prompt 要 4 分钟起步。所以别把窗口设得越大越好——
 > 窗口大是为了「不报错」，不是为了「每次都塞满」。
+
+电池上跑建议把空闲卸载调短，`bonsai idle 300`（5 分钟没请求就卸载，内存和 GPU 都还回去），
+插电再 `bonsai idle 900`。
 
 ## 思考模式：想太久 / 绕圈子怎么办
 

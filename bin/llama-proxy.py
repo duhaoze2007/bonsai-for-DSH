@@ -250,10 +250,14 @@ class State(object):
             }
 
     def idle_loop(self):
-        idle_limit = float(CFG.get("idle_unload_seconds", 900) or 0)
         while True:
             time.sleep(5)
             try:
+                # 每拍都重读配置：改 idle_unload_seconds 不用重启代理
+                try:
+                    idle_limit = float(load_config().get("idle_unload_seconds", 900) or 0)
+                except Exception:
+                    idle_limit = float(CFG.get("idle_unload_seconds", 900) or 0)
                 if idle_limit <= 0:
                     continue
                 with self.lock:

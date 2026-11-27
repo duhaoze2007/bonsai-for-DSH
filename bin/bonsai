@@ -11,6 +11,7 @@
 #   bonsai tool-test    验证工具调用（DSH Agent 依赖）
 #   bonsai logs [n]     看 llama-server 日志
 #   bonsai thinking [xhigh|medium|low|off|budget N]   思考模式：力度 / 关闭 / 设上限
+#   bonsai idle [秒数|off]                            空闲多久自动卸载（电池模式调到 300）
 #   bonsai doctor       自检（文件、二进制、端口）
 #   bonsai autostart on|off|status   登录时自动起代理（模型仍然按需加载）
 set -uo pipefail
@@ -236,6 +237,39 @@ ensure_proxy() {
     proxy_up
 }
 
+# 空闲自动卸载时长
+do_idle() {
+    local v="${1:-}"
+    if [ -z "$v" ]; then
+        python3 - "$CONFIG" <<'PY2'
+import json, sys
+d = json.load(open(sys.argv[1]))
+v = d.get("idle_unload_seconds", 900)
+print("当前空闲卸载: %s" % ("永不自动卸载" if v in (0, None) else "%d 秒后卸载" % v))
+print("  bonsai idle 300    # 电池模式：5 分钟没请求就卸载")
+print("  bonsai idle 900    # 默认")
+print("  bonsai idle off    # 永不自动卸载")
+PY2
+        return 0
+    fi
+    local val
+    case "$v" in
+        off|never|none) val=0 ;;
+        *[!0-9]*) red "用法: bonsai idle <秒数|off>"; return 1 ;;
+        *) val="$v" ;;
+    esac
+    python3 - "$CONFIG" "$val" <<'PY2'
+import json, sys
+path, val = sys.argv[1], int(sys.argv[2])
+d = json.load(open(path))
+d["idle_unload_seconds"] = val
+json.dump(d, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+open(path, "a", encoding="utf-8").write("\n")
+print("idle_unload_seconds = %s" % val)
+PY2
+    green "已保存（代理每 5s 重读，立即生效）"
+}
+
 # 思考模式：xhigh（默认）/ medium / off / budget N
 do_thinking() {
     local mode="${1:-}" amount="${2:-}"
@@ -433,6 +467,7 @@ case "$CMD" in
     unload)     do_unload ;;
     chat)       do_chat "$@" ;;
     thinking)   do_thinking "$@" ;;
+    idle)       do_idle "$@" ;;
     tool-test)  do_tool_test ;;
     logs)       tail -n "${1:-40}" "$BASE/logs/llama-server.log" ;;
     proxy-logs) tail -n "${1:-40}" "$PROXY_LOG" ;;
