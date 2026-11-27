@@ -10,6 +10,7 @@
 #   bonsai chat "问题"   冒烟测试一次对话
 #   bonsai tool-test    验证工具调用（DSH Agent 依赖）
 #   bonsai logs [n]     看 llama-server 日志
+#   bonsai thinking [xhigh|medium|low|off|budget N]   思考模式：力度 / 关闭 / 设上限
 #   bonsai doctor       自检（文件、二进制、端口）
 #   bonsai autostart on|off|status   登录时自动起代理（模型仍然按需加载）
 set -uo pipefail
@@ -68,6 +69,16 @@ if loaded:
 else:
     print("空闲回收  : 加载后空闲 %ds 自动卸载" % d["idle_unload_seconds"])
 print("上下文    : %d tokens" % d["context_size"])
+th = d.get("thinking") or {}
+mode = th.get("mode") or "xhigh"
+budget = th.get("budget")
+if mode == "off":
+    desc = "已关闭（不思考，直接作答）"
+else:
+    desc = "力度 %s" % mode
+    if isinstance(budget, int):
+        desc += "，思考预算 %d tok" % budget
+print("思考      : %s" % desc)
 print("统计      : 加载 %d 次 / 请求 %d 次 / 运行 %ds" % (d["load_count"], d["request_count"], d["uptime_seconds"]))
 if d.get("last_error"):
     print("最近错误  : %s" % d["last_error"].splitlines()[0])
@@ -81,25 +92,31 @@ do_start() {
         return 0
     fi
     mkdir -p "$BASE/logs"
-    local pid
-    pid=$(python3 "$BASE/bin/spawn.py" "$PROXY_LOG" /usr/bin/python3 "$BASE/bin/llama-proxy.py")
-    echo "$pid" > "$PIDFILE"
+    local pid=""
+    if [ -f "$AGENT_PLIST" ]; then
+        # 配了开机自启就交给 launchd 管，别再手工 spawn 一个跟它抢端口
+        launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" 2>/dev/null || true
+        launchctl kickstart "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null || true
+    else
+        pid=$(python3 "$BASE/bin/spawn.py" "$PROXY_LOG" /usr/bin/python3 "$BASE/bin/llama-proxy.py")
+        echo "$pid" > "$PIDFILE"
+    fi
     for _ in $(seq 1 40); do
         sleep 0.25
         if proxy_up; then
-            green "代理已启动 (pid $pid) → $ENDPOINT/v1"
+            green "代理已启动${pid:+ (pid $pid)} → $ENDPOINT/v1"
             echo "模型 $ALIAS 会在第一次推理请求时自动加载。"
             return 0
         fi
     done
     red "代理启动失败，看看日志："
-    tail -20 "$PROXY_LOG"
+    tail -20 "$PROXY_LOG" 2>/dev/null || tail -20 "$BASE/logs/proxy.err.log"
     return 1
 }
 
 do_stop() {
+    local pid; pid=$(proxy_pid)          # 先抓 pid：bootout 会把进程直接干掉
     launchctl bootout "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null
-    local pid; pid=$(proxy_pid)
     if [ -z "$pid" ]; then
         yellow "代理没在运行；顺便清掉残留的 llama-server"
         pkill -f "$BASE/runtime/llama-server" 2>/dev/null && echo "已结束残留 llama-server"
@@ -217,6 +234,79 @@ ensure_proxy() {
     yellow "代理未运行，先启动它..."
     do_start >/dev/null || return 1
     proxy_up
+}
+
+# 思考模式：xhigh（默认）/ medium / off / budget N
+do_thinking() {
+    local mode="${1:-}" amount="${2:-}"
+    if [ -z "$mode" ]; then
+        python3 - "$CONFIG" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+th = d.get("thinking") or {}
+m = th.get("mode") or "xhigh"
+b = th.get("budget")
+print("当前思考模式: mode=%s%s" % (m, "" if b is None else ", budget=%s tok" % b))
+print()
+print("  bonsai thinking xhigh          # 默认，最准，想得最多")
+print("  bonsai thinking medium         # 少想一些")
+print("  bonsai thinking budget 512     # 保留思考但设 512 token 上限（防循环）")
+print("  bonsai thinking budget none    # 取消上限")
+print("  bonsai thinking off            # 完全关掉思考")
+PY
+        return 0
+    fi
+
+    case "$mode" in
+        xhigh|medium|low|off)
+            python3 - "$CONFIG" "$mode" <<'PY'
+import json, sys
+path, mode = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+th = d.setdefault("thinking", {})
+th["mode"] = mode
+if mode == "off":
+    th["budget"] = None
+json.dump(d, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+open(path, "a", encoding="utf-8").write("\n")
+print("thinking.mode = %s" % mode)
+PY
+            ;;
+        budget)
+            case "$amount" in
+                ""|*[!0-9]*)
+                    if [ "$amount" != "none" ]; then
+                        red "用法: bonsai thinking budget <正整数|none>"; return 1
+                    fi
+                    ;;
+            esac
+            python3 - "$CONFIG" "$amount" <<'PY'
+import json, sys
+path, amount = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+th = d.setdefault("thinking", {})
+th["budget"] = None if amount == "none" else int(amount)
+if amount != "none" and th.get("mode") == "off":
+    th["mode"] = "xhigh"      # 预算和「完全关闭」互斥，给了预算就恢复思考
+json.dump(d, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+open(path, "a", encoding="utf-8").write("\n")
+print("thinking.budget = %s" % th["budget"])
+PY
+            ;;
+        *)
+            red "用法: bonsai thinking [xhigh|medium|low|off|budget <n|none>]"
+            return 1
+            ;;
+    esac
+
+    # 配置改了要重新加载后端；代理会重读 config.json，所以只要卸载即可
+    if proxy_up; then
+        curl -s -m 60 -X POST "$ENDPOINT/admin/unload" >/dev/null 2>&1
+        green "已保存；模型已卸载，下一条请求会按新模式加载"
+    else
+        green "已保存；下次 bonsai start / 请求时生效"
+    fi
+    print_status 2>/dev/null | grep "思考" || true
 }
 
 do_doctor() {
@@ -342,6 +432,7 @@ case "$CMD" in
     load)       do_load ;;
     unload)     do_unload ;;
     chat)       do_chat "$@" ;;
+    thinking)   do_thinking "$@" ;;
     tool-test)  do_tool_test ;;
     logs)       tail -n "${1:-40}" "$BASE/logs/llama-server.log" ;;
     proxy-logs) tail -n "${1:-40}" "$PROXY_LOG" ;;

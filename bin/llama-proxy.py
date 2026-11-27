@@ -54,6 +54,30 @@ class BackendError(RuntimeError):
     pass
 
 
+def thinking_args(cfg):
+    """把 config.json 里的 thinking 配置翻译成 llama-server 的思考开关。
+
+    thinking.mode:
+      "xhigh"/"medium"/"low" —— 模板支持的推理力度
+      "off"                  —— 完全关掉思考（模板直接给空 think 块）
+    另外 thinking.budget（整数）给思考 token 设硬上限，防止想了半天收不回来。
+    """
+    th = cfg.get("thinking") or {}
+    mode = str(th.get("mode") or "").strip().lower()
+    if mode == "off":
+        return ["--reasoning", "off"]
+    args = ["--reasoning", "on"]
+    if mode in ("xhigh", "medium", "low"):
+        # allow 列表挡住客户端瞎传的 effort（模板会对未知值直接 500），越界的回落到 medium
+        args += ["--reasoning-effort", mode,
+                 "--reasoning-effort-allow", "xhigh,medium,low",
+                 "--reasoning-effort-fallback", "medium"]
+    budget = th.get("budget")
+    if isinstance(budget, int) and not isinstance(budget, bool) and budget >= 0:
+        args += ["--reasoning-budget", str(budget)]
+    return args
+
+
 class State(object):
     """llama-server 子进程的生命周期 + 空闲回收。"""
 
@@ -104,7 +128,13 @@ class State(object):
 
     # ---- 生命周期 ----
     def start(self):
+        global CFG
         with self.lock:
+            # 每次加载都重读配置：改完 config.json（比如切思考模式）只要 unload 就能生效
+            try:
+                CFG = load_config()
+            except Exception as exc:
+                log("config reload failed, keep cached config: %r" % (exc,))
             if self._proc_alive() and self.healthy():
                 self.last_activity = time.time()
                 return
@@ -122,7 +152,7 @@ class State(object):
                 "--host", CFG["backend_host"],
                 "--port", str(CFG["backend_port"]),
                 "-c", str(CFG["context_size"]),
-            ] + [str(a) for a in CFG.get("server_args", [])]
+            ] + [str(a) for a in CFG.get("server_args", [])] + thinking_args(CFG)
 
             log("loading model: %s" % " ".join(shlex.quote(c) for c in cmd))
             logfile = open(os.path.join(LOGS_DIR, "llama-server.log"), "ab")
@@ -190,6 +220,12 @@ class State(object):
             self.last_activity = time.time()
 
     def status(self):
+        # 状态永远读磁盘上的配置，避免刚改完 thinking 却显示旧值
+        global CFG
+        try:
+            CFG = load_config()
+        except Exception:
+            pass
         with self.lock:
             loaded = self._proc_alive()
             idle = time.time() - self.last_activity
@@ -208,6 +244,7 @@ class State(object):
                 "load_count": self.load_count,
                 "request_count": self.request_count,
                 "context_size": CFG["context_size"],
+                "thinking": CFG.get("thinking") or {},
                 "endpoint": "http://%s:%d/v1" % (CFG["proxy_host"], CFG["proxy_port"]),
                 "last_error": self.last_error,
             }

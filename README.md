@@ -41,6 +41,7 @@ cat dsh/bonsai-provider.patch.yml
 | `bonsai tool-test` | 验证原生工具调用 |
 | `bonsai logs [n]` / `proxy-logs [n]` | 看后端 / 代理日志 |
 | `bonsai doctor` | 自检：文件、运行时、端口、自启状态 |
+| `bonsai thinking …` | 思考模式：力度 / 预算上限 / 完全关闭 |
 | `bonsai autostart on\|off\|status` | 登录自启开关（LaunchAgent，只跑代理） |
 
 `bonsai` 会被装到 `~/.local/bin`，脚本本身按真实路径定位安装目录，仓库放哪都行。
@@ -52,6 +53,43 @@ cat dsh/bonsai-provider.patch.yml
    最后一条请求后空闲 `idle_unload_seconds`（默认 900s）自动卸载。
 2. **手动**：`bonsai load` 预热、`bonsai unload` 立即释放内存。
 3. **彻底停**：`bonsai stop`，代理和模型都退出（自启已开的话下次登录会再起来）。
+
+## 思考模式：想太久 / 绕圈子怎么办
+
+这批三进制模型是「默认思考」的（Qwen3.8 底座），思考 token 也走解码预算。所以有两个坑：
+
+- **想太久**：思考吃掉全部 `max_tokens`，正文一个字都没出来 —— 在 agent 循环里看起来就像卡住。
+- **绕圈子**：上一代 Bonsai 2 被抱怨过（[HF discussion #63](https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/discussions/63)），
+  官方说 2.5 就是来修这个的；但 2.5 的讨论区仍有「Overthinker」反馈
+  （[#6](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF/discussions/6)），
+  有人在 CPU + Q2_0 上真的绕成了「我保证这是最后一次问你」。
+
+本机实测（M4 Pro，18 次运行，3 档 × 6 个 prompt）：**没有复现重复循环**（30 字符滑窗重复率 0%），
+但**复现了想太久**：无上限的 xhigh 问「详细设计电商订单系统表结构」，思考吃掉全部 1500 token，
+回答 0 字；同一问题加 `budget 200` 后，思考收到 200 token 就收尾，答出 2782 字完整设计。
+
+所以给了四档：
+
+```bash
+bonsai thinking                      # 看当前档位
+bonsai thinking xhigh                # 默认，最准
+bonsai thinking medium               # 少想一点（实测和 xhigh 差别不稳定）
+bonsai thinking budget 1024          # 保留思考但设硬上限，超了强制收尾作答 ← 默认
+bonsai thinking budget none          # 取消上限
+bonsai thinking off                  # 完全不思考
+```
+
+`budget` 走 llama.cpp 的 `--reasoning-budget`，`off` 走 `--reasoning off`（模板直接给空 think 块）。
+改完只需要卸载后端，下一条请求自动按新档位重载：
+
+| 档位 | 适合 | 实测（同一批 prompt） |
+| --- | --- | --- |
+| `off` | 闲聊、短问答、要最快 | 短问题 2.6s vs 6.0s；脚本类 12.8s vs 38.8s；复杂推理答得更长也更浅 |
+| `budget 1024`（默认） | 日常 agent / 工具调用 | 正常问题思考 400–500 token，跑飞时兜得住 |
+| `budget 200` | 只要快、能接受浅一点 | 强制收尾，仍能给出完整答案 |
+| `xhigh` 无上限 | 硬推理、离线批处理 | 质量最好，但可能一个答案都不给 |
+
+> 权衡：官方 benchmark 全部是思考模式测的，关掉思考会掉质量，复杂任务建议留着、只设预算。
 
 ## 实测（MacBook Pro M4 Pro / 24 GB）
 
@@ -78,9 +116,11 @@ cat dsh/bonsai-provider.patch.yml
 | `proxy_port` / `backend_port` | 8123 / 8124 | 代理对外的端口 / 后端仅本机 |
 | `context_size` | 32768 | 上下文；降到 16384 省约 1 GB，但 agent 提示就占掉大半 |
 | `idle_unload_seconds` | 900 | 空闲多久卸载；`0` = 永不自动卸载 |
+| `thinking` | `{"mode":"xhigh","budget":1024}` | 思考档位；`mode` = `xhigh`/`medium`/`low`/`off`，`budget` = 思考 token 硬上限（`null` = 不限） |
 | `server_args` | 见文件 | 透传给 llama-server 的参数（Metal 全量 offload + MTP 草稿头 + 采样默认值） |
 
-改完 `bonsai restart` 生效。
+`server_args` 和 `context_size` 改完要 `bonsai restart`；`thinking` 用 `bonsai thinking …` 改，
+只会卸载后端、下一条请求自动重载。
 
 - **MTP 草稿头**：`--spec-type draft-mtp --spec-draft-n-min 0 --spec-draft-n-max 1 --spec-draft-p-min 0.6`
   是官方 Metal preset 在 M4 Pro 上的设置。去掉这三个参数就是纯解码（约 22 tok/s，预填充略快）。
@@ -111,6 +151,9 @@ Q2_0 慢一些（官方同卡 109 vs 150 tok/s），好处是运行时可以直�
 | DSH | 需要装有 `dsh-local-model` 插件（provider id `local`） |
 
 ## 常见问题
+
+**只输出思考、正文是空的 / 回合被截断** —— 思考 token 吃完了预算。
+`bonsai thinking budget 1024`（或更小）给它设上限，或者 `bonsai thinking off` 直接关掉。
 
 **模型列表里有，但一发消息就卡住** —— 首次请求在加载权重（15s 左右）+ 预填充，
 DSH 那边的流超时给足（`streamIdleTimeoutMs` 至少 600000）。
