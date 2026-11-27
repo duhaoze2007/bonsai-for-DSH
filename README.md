@@ -16,7 +16,7 @@ DSH ──► bonsai 代理 :8123 ──(首次请求才拉起)──► llama-s
 ## 快速开始
 
 ```bash
-git clone https://github.com/<you>/bonsai-for-DSH.git
+git clone https://github.com/duhaoze2007/bonsai-for-DSH.git
 cd bonsai-for-DSH
 ./installer/install.sh --autostart      # 下载 7.0 GB 权重 + 运行时，配置登录自启
 ```
