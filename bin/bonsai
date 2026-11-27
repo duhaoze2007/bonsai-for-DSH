@@ -1,0 +1,353 @@
+#!/bin/bash
+# bonsai —— Ternary Bonsai 2.5 27B 本地模型管理器
+#
+#   bonsai start        启动代理（模型按需加载，不常驻内存）
+#   bonsai stop         关代理并卸载模型
+#   bonsai restart      重启代理
+#   bonsai status       代理 / 模型状态
+#   bonsai load         立刻把模型读进内存（预热，约 10-20s）
+#   bonsai unload       立刻卸载模型，释放内存
+#   bonsai chat "问题"   冒烟测试一次对话
+#   bonsai tool-test    验证工具调用（DSH Agent 依赖）
+#   bonsai logs [n]     看 llama-server 日志
+#   bonsai doctor       自检（文件、二进制、端口）
+#   bonsai autostart on|off|status   登录时自动起代理（模型仍然按需加载）
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+BASE="$(python3 -c 'import os,sys;print(os.path.dirname(os.path.dirname(os.path.realpath(sys.argv[1]))))' "$SELF")"
+CONFIG="$BASE/config.json"
+PROXY_LOG="$BASE/logs/proxy.log"
+PIDFILE="$BASE/logs/proxy.pid"
+AGENT_LABEL="com.dsh.bonsai-proxy"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+
+if [ ! -f "$CONFIG" ]; then
+    echo "找不到 $CONFIG —— 先跑 installer/install.sh 生成配置" >&2
+    exit 1
+fi
+
+CFG() { python3 -c "import json,sys;print(json.load(open('$CONFIG'))['$1'])"; }
+PROXY_HOST=$(CFG proxy_host)
+PROXY_PORT=$(CFG proxy_port)
+ALIAS=$(CFG model_alias)
+ENDPOINT="http://$PROXY_HOST:$PROXY_PORT"
+
+green() { printf "\033[32m%s\033[0m\n" "$*"; }
+yellow() { printf "\033[33m%s\033[0m\n" "$*"; }
+red() { printf "\033[31m%s\033[0m\n" "$*"; }
+
+proxy_pid() {
+    if [ -f "$PIDFILE" ]; then
+        local p; p=$(cat "$PIDFILE")
+        if kill -0 "$p" 2>/dev/null; then echo "$p"; return 0; fi
+    fi
+    pgrep -f "llama-proxy.py" | head -1
+}
+
+proxy_up() { curl -s -m 3 -o /dev/null "$ENDPOINT/admin/status"; }
+
+status_json() { curl -s -m 5 "$ENDPOINT/admin/status"; }
+
+print_status() {
+    local json; json=$(status_json)
+    if [ -z "$json" ]; then
+        red "代理未运行 —— 执行 bonsai start 启动（模型仍会按需加载）"
+        return 1
+    fi
+    python3 - "$json" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+loaded = d["backend"] == "loaded"
+print("代理      : %s (%s)" % (d["endpoint"], d["proxy"]))
+print("模型      : %s  [%s]" % (d["model"], "已加载" if loaded else "未加载（按需加载）"))
+if loaded:
+    print("内存占用  : %d MB (pid %d, 已加载 %ds)" % (d["rss_mb"], d["pid"], d["loaded_seconds"]))
+    left = max(0, d["idle_unload_seconds"] - d["idle_seconds"])
+    print("空闲回收  : 已空闲 %ds，%ds 后自动卸载" % (d["idle_seconds"], left))
+else:
+    print("空闲回收  : 加载后空闲 %ds 自动卸载" % d["idle_unload_seconds"])
+print("上下文    : %d tokens" % d["context_size"])
+print("统计      : 加载 %d 次 / 请求 %d 次 / 运行 %ds" % (d["load_count"], d["request_count"], d["uptime_seconds"]))
+if d.get("last_error"):
+    print("最近错误  : %s" % d["last_error"].splitlines()[0])
+PY
+}
+
+do_start() {
+    if proxy_up; then
+        yellow "代理已在运行：$ENDPOINT"
+        print_status
+        return 0
+    fi
+    mkdir -p "$BASE/logs"
+    local pid
+    pid=$(python3 "$BASE/bin/spawn.py" "$PROXY_LOG" /usr/bin/python3 "$BASE/bin/llama-proxy.py")
+    echo "$pid" > "$PIDFILE"
+    for _ in $(seq 1 40); do
+        sleep 0.25
+        if proxy_up; then
+            green "代理已启动 (pid $pid) → $ENDPOINT/v1"
+            echo "模型 $ALIAS 会在第一次推理请求时自动加载。"
+            return 0
+        fi
+    done
+    red "代理启动失败，看看日志："
+    tail -20 "$PROXY_LOG"
+    return 1
+}
+
+do_stop() {
+    launchctl bootout "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null
+    local pid; pid=$(proxy_pid)
+    if [ -z "$pid" ]; then
+        yellow "代理没在运行；顺便清掉残留的 llama-server"
+        pkill -f "$BASE/runtime/llama-server" 2>/dev/null && echo "已结束残留 llama-server"
+        return 0
+    fi
+    kill "$pid" 2>/dev/null
+    for _ in $(seq 1 40); do
+        sleep 0.25
+        kill -0 "$pid" 2>/dev/null || break
+    done
+    kill -9 "$pid" 2>/dev/null
+    pkill -f "$BASE/runtime/llama-server" 2>/dev/null
+    rm -f "$PIDFILE"
+    green "已停止代理并卸载模型，内存已释放"
+}
+
+do_chat() {
+    local prompt="${1:-用一句话解释什么是三进制量化模型。}"
+    local t0; t0=$(python3 -c 'import time;print(time.time())')
+    local out
+    out=$(curl -s -m 600 "$ENDPOINT/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -d "$(python3 -c '
+import json, sys
+print(json.dumps({
+  "model": sys.argv[1],
+  "messages": [{"role": "user", "content": sys.argv[2]}],
+  "temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0,
+  "max_tokens": 512, "stream": False,
+}))' "$ALIAS" "$prompt")")
+    local t1; t1=$(python3 -c 'import time;print(time.time())')
+    echo "$out" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception:
+    print(raw[:1500]); sys.exit(1)
+if "error" in d:
+    print("错误:", d["error"]); sys.exit(1)
+ch = d["choices"][0]["message"]
+content = ch.get("content") or ""
+print("--- 回答 ---")
+print(content.strip())
+usage = d.get("usage", {})
+print("--- 用量 ---")
+print("prompt %s tok / completion %s tok" % (usage.get("prompt_tokens"), usage.get("completion_tokens")))
+'
+    echo "--- 耗时 ---"
+    python3 -c "print('%.1fs（含首次加载）' % ($t1 - $t0))"
+}
+
+do_tool_test() {
+    curl -s -m 600 "$ENDPOINT/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -d "$(python3 -c '
+import json, sys
+print(json.dumps({
+  "model": sys.argv[1],
+  "messages": [{"role": "user", "content": "北京现在多少度？用工具查。"}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "查询某个城市的实时天气",
+      "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string", "description": "城市名"}},
+        "required": ["city"],
+      },
+    },
+  }],
+  "tool_choice": "auto",
+  "temperature": 0.7, "max_tokens": 512, "stream": False,
+}))' "$ALIAS")" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+msg = d["choices"][0]["message"]
+calls = msg.get("tool_calls") or []
+if calls:
+    print("✅ 工具调用正常：")
+    for c in calls:
+        print("   %s(%s)" % (c["function"]["name"], c["function"]["arguments"]))
+else:
+    print("⚠️ 没有产生 tool_calls，模型回复：")
+    print((msg.get("content") or "")[:500])
+'
+}
+
+do_load() {
+    ensure_proxy || return 1
+    yellow "加载模型（约 10-30s，首次可能要更久）..."
+    local t0; t0=$(date +%s)
+    local out; out=$(curl -s -m 900 -X POST "$ENDPOINT/admin/load")
+    local t1; t1=$(date +%s)
+    if echo "$out" | grep -q '"backend": "loaded"'; then
+        green "模型已就绪，用时 $((t1 - t0))s"
+        print_status
+    else
+        red "加载失败："
+        echo "$out" | head -30
+        return 1
+    fi
+}
+
+do_unload() {
+    ensure_proxy || return 1
+    curl -s -m 60 -X POST "$ENDPOINT/admin/unload" >/dev/null
+    sleep 1
+    green "模型已卸载，内存已释放"
+}
+
+ensure_proxy() {
+    if proxy_up; then return 0; fi
+    yellow "代理未运行，先启动它..."
+    do_start >/dev/null || return 1
+    proxy_up
+}
+
+do_doctor() {
+    local ok=0
+    echo "== 文件检查 =="
+    local model; model=$(CFG model_path)
+    if [ -f "$model" ]; then
+        echo "✅ 模型: $(du -h "$model" | cut -f1)  $(basename "$model")"
+    else
+        red "❌ 缺少模型文件: $model"; ok=1
+    fi
+    local runtime; runtime=$(CFG runtime_dir)
+    if [ -x "$runtime/llama-server" ]; then
+        echo "✅ 运行时: $("$runtime/llama-server" --version 2>&1 | head -1)"
+    else
+        red "❌ 缺少运行时: $runtime/llama-server"; ok=1
+    fi
+    echo "== 端口 =="
+    if lsof -nP -iTCP:"$PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "✅ 代理端口 $PROXY_PORT 监听中"
+    else
+        yellow "· 代理端口 $PROXY_PORT 未监听（bonsai start 启动）"
+    fi
+    echo "== 开机自启 =="
+    if [ -f "$AGENT_PLIST" ]; then
+        if launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1; then
+            echo "✅ LaunchAgent 已加载（仅代理，模型仍按需加载）"
+        else
+            yellow "· plist 存在但未加载（launchctl bootstrap 或重登录）"
+        fi
+    else
+        yellow "· 未配置开机自启（bonsai autostart on）"
+    fi
+    echo "== 内存 =="
+    echo "物理内存: $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+    echo "== DSH 端点 =="
+    echo "provider=openai  baseURL=$ENDPOINT/v1  model=$ALIAS"
+    return $ok
+}
+
+plist_render() {
+    mkdir -p "$(dirname "$AGENT_PLIST")" "$BASE/logs"
+    cat > "$AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$AGENT_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>$BASE/bin/llama-proxy.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$BASE</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>$BASE/logs/proxy.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>$BASE/logs/proxy.err.log</string>
+</dict>
+</plist>
+PLIST
+}
+
+do_autostart() {
+    local action="${1:-status}"
+    case "$action" in
+        on)
+            plist_render
+            # 先停掉手工起的代理，避免抢端口
+            local pid; pid=$(proxy_pid)
+            if [ -n "$pid" ]; then
+                kill "$pid" 2>/dev/null; sleep 1; kill -9 "$pid" 2>/dev/null
+                rm -f "$PIDFILE"
+            fi
+            pkill -f "$BASE/runtime/llama-server" 2>/dev/null
+            launchctl bootout "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null
+            launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" || { red "bootstrap 失败"; return 1; }
+            launchctl enable "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null
+            sleep 2
+            if proxy_up; then
+                green "已配置开机自启：登录后自动起代理（模型仍然按需加载，不预加载）"
+                print_status
+            else
+                red "plist 已写入但代理没起来，看日志 $BASE/logs/proxy.err.log"
+                return 1
+            fi
+            ;;
+        off)
+            launchctl bootout "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null
+            rm -f "$AGENT_PLIST"
+            green "已取消开机自启（plist 已删除）"
+            ;;
+        status)
+            if [ -f "$AGENT_PLIST" ] && launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1; then
+                green "开机自启：已启用（$AGENT_PLIST）"
+                launchctl print "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null | grep -E "^\s+(state|pid) " | head -3
+            else
+                yellow "开机自启：未启用"
+            fi
+            ;;
+        *)
+            echo "用法: bonsai autostart on|off|status"
+            return 1
+            ;;
+    esac
+}
+
+CMD="${1:-status}"
+shift || true
+case "$CMD" in
+    start)      do_start ;;
+    stop)       do_stop ;;
+    restart)    do_stop; sleep 1; do_start ;;
+    status)     print_status ;;
+    load)       do_load ;;
+    unload)     do_unload ;;
+    chat)       do_chat "$@" ;;
+    tool-test)  do_tool_test ;;
+    logs)       tail -n "${1:-40}" "$BASE/logs/llama-server.log" ;;
+    proxy-logs) tail -n "${1:-40}" "$PROXY_LOG" ;;
+    doctor)     do_doctor ;;
+    autostart)  do_autostart "$@" ;;
+    *)
+        sed -n '2,17p' "$SELF" | sed 's/^# \{0,1\}//'
+        ;;
+esac

@@ -1,0 +1,13 @@
+# ── 本地资产（不随仓库分发）──
+models/
+runtime/
+logs/
+config.json
+
+# ── 运行时杂项 ──
+*.log
+*.pid
+*.gguf
+*.aria2
+__pycache__/
+.DS_Store

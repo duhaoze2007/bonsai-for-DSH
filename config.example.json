@@ -1,0 +1,26 @@
+{
+  "display_name": "Ternary Bonsai 2.5 27B",
+  "model_path": "<BASE>/models/Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf",
+  "model_alias": "bonsai-2.5-27b",
+  "runtime_dir": "<BASE>/runtime",
+  "logs_dir": "<BASE>/logs",
+  "proxy_host": "127.0.0.1",
+  "proxy_port": 8123,
+  "backend_host": "127.0.0.1",
+  "backend_port": 8124,
+  "context_size": 32768,
+  "server_args": [
+    "-ngl", "99",
+    "-fa", "on",
+    "-np", "1",
+    "--spec-type", "draft-mtp",
+    "--spec-draft-n-min", "0",
+    "--spec-draft-n-max", "1",
+    "--spec-draft-p-min", "0.6",
+    "--top-p", "0.95",
+    "--top-k", "20",
+    "--min-p", "0"
+  ],
+  "idle_unload_seconds": 900,
+  "start_timeout_seconds": 240
+}
