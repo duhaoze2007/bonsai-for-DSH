@@ -54,6 +54,27 @@ cat dsh/bonsai-provider.patch.yml
 2. **手动**：`bonsai load` 预热、`bonsai unload` 立即释放内存。
 3. **彻底停**：`bonsai stop`，代理和模型都退出（自启已开的话下次登录会再起来）。
 
+## 上下文预算：别让 DSH 撑爆窗口
+
+DSH 每轮都会往 prompt 里塞系统提示、工具清单、工作区说明（AGENTS.md）、运行时上下文和对话历史。
+在本地模型上这些加起来就有 **约 16K token**，所以「后端窗口」不能贴着客户端声明的窗口设：
+
+- DSH 侧 `contextWindow` = 32768（`dsh-local-model` 插件配置）
+- 后端 `context_size` = **65536**（两倍余量）
+
+踩过的坑：两者都设 32768 时，一轮自我介绍请求实际 33797 token，直接被后端拒：
+
+```
+400 Bad Request — request (33797 tokens) exceeds the available context size (32768 tokens)
+```
+
+`33797 + maxTokens 8192 = 41989 < 65536`，现在这种溢出有足够余量。
+如果还想更保守，把 DSH 的 `contextWindow` 降到 24576（改 `cordis.patch.yml` 后重启 DSH），
+代价是更早触发历史压缩。
+
+> 预填充只有 90–130 tok/s，32K 的 prompt 要 4 分钟起步。所以别把窗口设得越大越好——
+> 窗口大是为了「不报错」，不是为了「每次都塞满」。
+
 ## 思考模式：想太久 / 绕圈子怎么办
 
 这批三进制模型是「默认思考」的（Qwen3.8 底座），思考 token 也走解码预算。所以有两个坑：
@@ -96,7 +117,7 @@ bonsai thinking off                  # 完全不思考
 | 指标 | 数值 |
 | --- | --- |
 | 模型加载 | 15s（首次读盘）、4s（文件已在页缓存） |
-| 常驻内存 | 10.0–10.4 GB（含 32K 上下文 KV） |
+| 常驻内存 | 11.4 GB（64K 上下文 KV）；32K 时 10.3 GB |
 | 生成速度 | 20–21 tok/s（MTP 草稿接受率 0.82–1.0） |
 | 预填充 | 90–130 tok/s；16K token 的 agent 提示约 3 分钟 |
 | 工具调用 | 原生 `tool_calls`，流式增量、多轮循环都正常 |
@@ -114,7 +135,7 @@ bonsai thinking off                  # 完全不思考
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `proxy_port` / `backend_port` | 8123 / 8124 | 代理对外的端口 / 后端仅本机 |
-| `context_size` | 32768 | 上下文；降到 16384 省约 1 GB，但 agent 提示就占掉大半 |
+| `context_size` | 65536 | 后端上下文窗口；每 32K 约多占 1.1 GB 内存 |
 | `idle_unload_seconds` | 900 | 空闲多久卸载；`0` = 永不自动卸载 |
 | `thinking` | `{"mode":"xhigh","budget":1024}` | 思考档位；`mode` = `xhigh`/`medium`/`low`/`off`，`budget` = 思考 token 硬上限（`null` = 不限） |
 | `server_args` | 见文件 | 透传给 llama-server 的参数（Metal 全量 offload + MTP 草稿头 + 采样默认值） |
